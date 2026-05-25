@@ -1,0 +1,20 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/devices/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+backend/.env
+backend/captured_traffic.jsonl
+/tmp/pyaarlo/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Vercel
+.vercel/
+
+# OS
+.DS_Store
