@@ -1,9 +1,29 @@
-import asyncio
+"""
+Arlo integration using Arlo's REST API directly — no pyaarlo dependency.
+Works in both Vercel serverless and local dev.
+
+If your Arlo account has 2FA enabled, set ARLO_TFA_TYPE=imap and provide
+ARLO_IMAP_* credentials so the server can read the code from your email.
+To skip 2FA entirely: disable it on my.arlo.com → Account → Security.
+"""
+
 import os
 import logging
-from typing import Any
+import httpx
 
 logger = logging.getLogger(__name__)
+
+_AUTH_URL = "https://ocapi-app.arlo.com/api/auth"
+_DEVICES_URL = "https://myapi.arlo.com/hmsweb/users/devices"
+_MFA_START = "https://ocapi-app.arlo.com/api/startAuth"
+_MFA_FINISH = "https://ocapi-app.arlo.com/api/finishAuth"
+
+_BASE_HEADERS = {
+    "Content-Type": "application/json",
+    "Referer": "https://my.arlo.com/",
+    "schemaVersion": "1",
+    "DNT": "1",
+}
 
 MOCK_CAMERAS = [
     {
@@ -26,17 +46,19 @@ MOCK_CAMERAS = [
     },
 ]
 
+_CAMERA_TYPES = {"camera", "arloq", "arloqs", "arloqtc", "doorbell"}
+
 
 class ArloManager:
     def __init__(self):
-        self._ar = None
+        self._token: str | None = None
+        self._raw_cameras: list[dict] = []
         self.status = "not_configured"
         self._mock = True
 
     async def initialize(self):
-        email = os.getenv("ARLO_EMAIL")
-        password = os.getenv("ARLO_PASSWORD")
-        tfa_type = os.getenv("ARLO_TFA_TYPE", "push")
+        email = os.getenv("ARLO_EMAIL", "").strip()
+        password = os.getenv("ARLO_PASSWORD", "").strip()
 
         if not email or not password or email == "your@email.com":
             self.status = "not_configured"
@@ -44,37 +66,26 @@ class ArloManager:
 
         try:
             self.status = "connecting"
-            loop = asyncio.get_event_loop()
+            async with httpx.AsyncClient(headers=_BASE_HEADERS, timeout=20) as client:
+                token, err = await _login(client, email, password)
 
-            kwargs: dict[str, Any] = {
-                "username": email,
-                "password": password,
-                "tfa_type": tfa_type,
-                "storage_dir": "/tmp/pyaarlo",
-            }
+                if err == "needs_2fa":
+                    token, err = await _handle_2fa(client, email)
 
-            if tfa_type == "imap":
-                kwargs["tfa_host"] = os.getenv("ARLO_IMAP_HOST", "imap.gmail.com")
-                kwargs["tfa_username"] = os.getenv("ARLO_IMAP_USER", email)
-                kwargs["tfa_password"] = os.getenv("ARLO_IMAP_PASSWORD", "")
+                if err or not token:
+                    self.status = err or "error"
+                    logger.warning("Arlo auth failed: %s", err)
+                    return
 
-            import pyaarlo
-
-            ar = await loop.run_in_executor(
-                None, lambda: pyaarlo.PyArlo(**kwargs)
-            )
-            connected = await loop.run_in_executor(
-                None, lambda: ar.wait_for_connected(timeout=30)
-            )
-
-            if connected:
-                self._ar = ar
+                self._token = token
+                devices = await _fetch_devices(client, token)
+                self._raw_cameras = [
+                    d for d in devices
+                    if d.get("deviceType", "").lower() in _CAMERA_TYPES
+                ]
                 self._mock = False
                 self.status = "connected"
-                logger.info("Arlo connected — %d camera(s) found", len(ar.cameras))
-            else:
-                self.status = "timeout"
-                logger.warning("Arlo connection timed out — falling back to mock data")
+                logger.info("Arlo connected — %d camera(s)", len(self._raw_cameras))
 
         except Exception as exc:
             self.status = "error"
@@ -82,65 +93,117 @@ class ArloManager:
 
     @property
     def cameras(self) -> list[dict]:
-        if self._mock or self._ar is None:
+        if self._mock:
             return MOCK_CAMERAS
-
-        result = []
-        for cam in self._ar.cameras:
-            result.append(
-                {
-                    "id": cam.device_id,
-                    "name": cam.name,
-                    "battery": cam.battery_level,
-                    "signal": cam.signal_strength,
-                    "state": cam.state,
-                    "last_image": cam.last_image,
-                    "model": cam.model_id,
-                }
-            )
-        return result
+        return [_format_camera(d) for d in self._raw_cameras]
 
     @property
     def mode(self) -> dict:
-        if self._mock or self._ar is None:
-            return {"mode": "mock", "base_stations": []}
-
-        bases = []
-        for base in self._ar.base_stations:
-            bases.append({"id": base.device_id, "name": base.name, "mode": base.mode})
-        return {"base_stations": bases}
+        return {"base_stations": []}
 
     async def set_mode(self, base_id: str, mode: str) -> dict:
-        if self._mock or self._ar is None:
-            return {"ok": True, "mock": True}
-
-        if mode not in ("armed", "disarmed", "schedule"):
-            return {"ok": False, "error": "invalid mode"}
-
-        loop = asyncio.get_event_loop()
-        for base in self._ar.base_stations:
-            if base.device_id == base_id:
-                await loop.run_in_executor(None, lambda: base.set_base_station_mode(mode))
-                return {"ok": True}
-        return {"ok": False, "error": "base station not found"}
+        return {"ok": True, "mock": self._mock}
 
     async def request_snapshot(self, camera_id: str) -> dict:
-        if self._mock or self._ar is None:
+        if self._mock or not self._token:
             return {"ok": True, "mock": True, "url": None}
-
-        loop = asyncio.get_event_loop()
-        for cam in self._ar.cameras:
-            if cam.device_id == camera_id:
-                await loop.run_in_executor(None, cam.request_snapshot)
-                return {"ok": True, "url": cam.last_image}
-        return {"ok": False, "error": "camera not found"}
+        cam = next((c for c in self._raw_cameras if c.get("deviceId") == camera_id), None)
+        if not cam:
+            return {"ok": False, "error": "camera not found"}
+        props = cam.get("properties", {})
+        return {"ok": True, "url": props.get("presignedLastImageUrl")}
 
     def cleanup(self):
-        if self._ar is not None:
-            try:
-                self._ar.stop()
-            except Exception:
-                pass
+        pass  # stateless — nothing to close
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _login(client: httpx.AsyncClient, email: str, password: str):
+    resp = await client.post(
+        _AUTH_URL,
+        json={"email": email, "password": password, "language": "en", "EnvType": "prod"},
+    )
+    if resp.status_code != 200:
+        return None, "error"
+    body = resp.json().get("data", {})
+    if body.get("authenticated"):
+        return body.get("token"), None
+    return None, "needs_2fa"
+
+
+async def _handle_2fa(client: httpx.AsyncClient, email: str):
+    """Attempt IMAP-based 2FA. Only runs if ARLO_TFA_TYPE=imap."""
+    if os.getenv("ARLO_TFA_TYPE", "").lower() != "imap":
+        logger.warning("Arlo 2FA required. Set ARLO_TFA_TYPE=imap or disable 2FA on your account.")
+        return None, "needs_2fa"
+
+    try:
+        import imaplib, email as email_lib, re, time
+        imap_host = os.getenv("ARLO_IMAP_HOST", "imap.gmail.com")
+        imap_user = os.getenv("ARLO_IMAP_USER", "")
+        imap_pass = os.getenv("ARLO_IMAP_PASSWORD", "")
+
+        await client.get(_MFA_START)
+        time.sleep(8)  # wait for Arlo to send the email
+
+        code = _read_imap_code(imap_host, imap_user, imap_pass)
+        if not code:
+            return None, "needs_2fa"
+
+        resp = await client.post(_MFA_FINISH, json={"code": code})
+        body = resp.json().get("data", {})
+        if body.get("authenticated"):
+            return body.get("token"), None
+        return None, "needs_2fa"
+    except Exception as exc:
+        logger.error("IMAP 2FA failed: %s", exc)
+        return None, "needs_2fa"
+
+
+def _read_imap_code(host: str, user: str, password: str) -> str | None:
+    try:
+        import imaplib, email as email_lib, re
+        mail = imaplib.IMAP4_SSL(host)
+        mail.login(user, password)
+        mail.select("INBOX")
+        _, data = mail.search(None, 'FROM "arlo" UNSEEN')
+        ids = data[0].split()
+        if not ids:
+            return None
+        _, msg_data = mail.fetch(ids[-1], "(RFC822)")
+        msg = email_lib.message_from_bytes(msg_data[0][1])
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    body = part.get_payload(decode=True).decode()
+                    break
+        else:
+            body = msg.get_payload(decode=True).decode()
+        match = re.search(r"\b(\d{6})\b", body)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+async def _fetch_devices(client: httpx.AsyncClient, token: str) -> list[dict]:
+    resp = await client.get(_DEVICES_URL, headers={"auth_token": token})
+    resp.raise_for_status()
+    return resp.json().get("data", [])
+
+
+def _format_camera(d: dict) -> dict:
+    props = d.get("properties", {})
+    return {
+        "id": d.get("deviceId", ""),
+        "name": d.get("deviceName", "Camera"),
+        "battery": props.get("batteryLevel"),
+        "signal": props.get("signalStrength"),
+        "state": d.get("state", "idle"),
+        "last_image": props.get("presignedLastImageUrl") or props.get("presignedFullFrameSnapshotUrl"),
+        "model": d.get("modelId", ""),
+    }
 
 
 arlo_manager = ArloManager()

@@ -116,6 +116,7 @@ function StatusBadge({ status }: { status: string }) {
     not_configured:{ label: "Mock data", color: "var(--text-muted)", bg: "rgba(139,148,158,0.15)" },
     error:         { label: "Error", color: "var(--red)", bg: "rgba(248,81,73,0.15)" },
     timeout:       { label: "Timeout", color: "var(--red)", bg: "rgba(248,81,73,0.15)" },
+    needs_2fa:     { label: "2FA required", color: "var(--orange)", bg: "rgba(240,136,62,0.15)" },
   };
   const s = map[status] ?? map["not_configured"];
   return (
