@@ -1,125 +1,126 @@
 """
 One-time Arlo token setup script.
-Run this in your terminal to get a session token you can store in Vercel.
+Run this to get a session token to store in Vercel.
 
+  pip3 install curl_cffi
   python3 arlo_get_token.py
 
 You will be prompted for your Arlo email, password, and the SMS code.
-The script prints an ARLO_TOKEN value — paste it into Vercel env vars.
+The script prints an ARLO_TOKEN — paste it back into Claude.
 """
 
-import urllib.request
-import urllib.error
-import http.cookiejar
 import json
 import sys
 import getpass
 
-AUTH_URL  = "https://ocapi-app.arlo.com/api/auth"
-START_URL = "https://ocapi-app.arlo.com/api/startAuth"
+AUTH_URL   = "https://ocapi-app.arlo.com/api/auth"
+START_URL  = "https://ocapi-app.arlo.com/api/startAuth"
 FINISH_URL = "https://ocapi-app.arlo.com/api/finishAuth"
 
 HEADERS = {
     "Content-Type": "application/json",
     "Referer": "https://my.arlo.com/",
+    "Origin": "https://my.arlo.com",
     "schemaVersion": "1",
     "DNT": "1",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Origin": "https://my.arlo.com",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
-def request(opener, url, body=None, method=None):
-    data = json.dumps(body).encode() if body else None
-    m = method or ("POST" if data else "GET")
-    req = urllib.request.Request(url, data=data, headers=HEADERS, method=m)
+def get_session():
     try:
-        resp = opener.open(req, timeout=20)
-        return json.loads(resp.read()), None
-    except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code}: {e.read().decode()[:200]}"
-    except Exception as e:
-        return None, str(e)
+        from curl_cffi import requests
+        print("✓ Using curl_cffi (Chrome TLS impersonation)")
+        session = requests.Session(impersonate="chrome120")
+        session.headers.update(HEADERS)
+        return session, "curl_cffi"
+    except ImportError:
+        print("curl_cffi not found — install it first:")
+        print("  pip3 install curl_cffi")
+        sys.exit(1)
+
+
+def post(session, url, body):
+    resp = session.post(url, json=body, timeout=20)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    return resp.json()
 
 
 def main():
     print("=== Arlo Token Setup ===\n")
-    email = input("Arlo email: ").strip()
+    email    = input("Arlo email: ").strip()
     password = getpass.getpass("Arlo password: ")
 
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    session, _ = get_session()
 
-    print("\nLogging in...")
-    data, err = request(opener, AUTH_URL, {
-        "email": email, "password": password,
-        "language": "en", "EnvType": "prod"
-    })
-    if err:
-        print(f"Login error: {err}")
+    print("\nLogging in to Arlo...")
+    try:
+        data = post(session, AUTH_URL, {
+            "email": email,
+            "password": password,
+            "language": "en",
+            "EnvType": "prod",
+        })
+    except RuntimeError as e:
+        print(f"\n✗ Login failed: {e}")
         sys.exit(1)
 
     body = data.get("data", {})
+
     if body.get("authenticated"):
-        token = body.get("token")
-        print(f"\n✓ Logged in (no 2FA needed)\n\nARLO_TOKEN={token}")
+        token = body["token"]
+        _print_token(token)
         return
 
-    # 2FA required — find SMS factor
+    # 2FA required
     factors = body.get("factors", [])
-    sms_factor = next(
-        (f for f in factors if f.get("factorType", "").upper() == "SMS"), None
+    print(f"\n2FA required. Available factors: {[f.get('factorType') for f in factors]}")
+
+    # Prefer SMS, fall back to email
+    factor = next(
+        (f for f in factors if f.get("factorType", "").upper() == "SMS"),
+        next((f for f in factors if "MAIL" in f.get("factorType", "").upper()), None),
     )
-    if not sms_factor:
-        email_factor = next(
-            (f for f in factors if f.get("factorType", "").upper() in ("EMAIL", "MAIL")), None
-        )
-        sms_factor = email_factor
-        if sms_factor:
-            print("SMS 2FA not found — using email 2FA instead")
 
-    if not sms_factor:
-        print(f"No supported 2FA factor found. Available: {[f.get('factorType') for f in factors]}")
+    if not factor:
+        print("No SMS or email 2FA factor found.")
+        print(f"Raw response:\n{json.dumps(data, indent=2)}")
         sys.exit(1)
 
-    factor_id = sms_factor.get("factorId")
-    print(f"\n2FA required ({sms_factor.get('factorType')}). Sending code...")
-    data, err = request(opener, START_URL, {"factorId": factor_id})
-    if err:
-        print(f"Failed to start 2FA: {err}")
+    factor_id = factor["factorId"]
+    print(f"\nSending code via {factor.get('factorType')}...")
+
+    data2 = post(session, START_URL, {"factorId": factor_id})
+    factor_auth_code = data2.get("data", {}).get("factorAuthCode", "")
+
+    if not factor_auth_code:
+        print(f"Unexpected startAuth response:\n{json.dumps(data2, indent=2)}")
         sys.exit(1)
 
-    factor_auth_code = data.get("data", {}).get("factorAuthCode", "")
-    code = input("Enter the code from your SMS/email: ").strip()
+    code = input("Enter the code from your SMS: ").strip()
 
     print("Verifying...")
-    data, err = request(opener, FINISH_URL, {
+    data3 = post(session, FINISH_URL, {
         "factorAuthCode": factor_auth_code,
-        "otp": code
+        "otp": code,
     })
-    if err:
-        print(f"Verification error: {err}")
+
+    body3 = data3.get("data", {})
+    if not body3.get("authenticated"):
+        print(f"✗ Verification failed:\n{json.dumps(data3, indent=2)}")
         sys.exit(1)
 
-    body = data.get("data", {})
-    if not body.get("authenticated"):
-        print("Verification failed — check the code and try again.")
-        sys.exit(1)
+    _print_token(body3["token"])
 
-    token = body.get("token")
-    print(f"\n✓ Authenticated!\n")
+
+def _print_token(token: str):
+    print("\n" + "=" * 60)
+    print("✓  SUCCESS — paste this token back into Claude:")
     print("=" * 60)
-    print(f"ARLO_TOKEN={token}")
+    print(f"\nARLO_TOKEN={token}\n")
     print("=" * 60)
-    print("\nAdd this as an environment variable in Vercel:")
-    print("  vercel.com → home-hub → Settings → Environment Variables")
-    print("  Key: ARLO_TOKEN   Value: (paste the token above)")
 
 
 if __name__ == "__main__":
