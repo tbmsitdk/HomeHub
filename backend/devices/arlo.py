@@ -57,6 +57,12 @@ class ArloManager:
         self._mock = True
 
     async def initialize(self):
+        # If a pre-authenticated token is set (e.g. from the setup script), use it directly.
+        token = os.getenv("ARLO_TOKEN", "").strip()
+        if token:
+            await self._connect_with_token(token)
+            return
+
         email = os.getenv("ARLO_EMAIL", "").strip()
         password = os.getenv("ARLO_PASSWORD", "").strip()
 
@@ -90,6 +96,23 @@ class ArloManager:
         except Exception as exc:
             self.status = "error"
             logger.error("Arlo init failed: %s", exc)
+
+    async def _connect_with_token(self, token: str):
+        try:
+            self.status = "connecting"
+            async with httpx.AsyncClient(headers=_BASE_HEADERS, timeout=20) as client:
+                devices = await _fetch_devices(client, token)
+                self._token = token
+                self._raw_cameras = [
+                    d for d in devices
+                    if d.get("deviceType", "").lower() in _CAMERA_TYPES
+                ]
+                self._mock = False
+                self.status = "connected"
+                logger.info("Arlo connected via token — %d camera(s)", len(self._raw_cameras))
+        except Exception as exc:
+            self.status = "error"
+            logger.error("Arlo token auth failed: %s", exc)
 
     @property
     def cameras(self) -> list[dict]:
